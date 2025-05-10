@@ -158,7 +158,8 @@ async function streamHash(stream, algorithm = 'sha256') {
 
 // XXX: clean up old sessions
 const upload_sessions = {};
-const access = await get_users();
+
+let access = await get_users();
 
 // for restricting garbage collection
 let last_upload = 0;
@@ -453,6 +454,11 @@ async function garbage_collection() {
 }
 
 garbage_collection();
+
+process.on('SIGHUP', () => {
+    access = get_users();
+    console.log('access file reloaded');
+});
 
 Bun.serve({
     port: env.BIND_PORT,
