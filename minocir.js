@@ -43,6 +43,8 @@ if (await access_file.exists()) {
         # format: user:token:perms
         # perms is a string made of 'r' for read, 'w' for write
         # Beware, token is in plain text. Only use generated tokens, not user passwords.
+        # The special combination *:* is anonymous access
+        *:*:r
     `.split('\n').map(l => l.trim()).filter(l => l).join('\n') + '\n');
 }
 
@@ -62,6 +64,11 @@ async function authenticate(req, perm) {
     function assert(predicate) {
         if (predicate) return;
 
+        const hostname = req.headers.get('host');
+        if (!hostname) {
+            throw new ApiError(400, "Host header not present. Cannot create token.");
+        }
+
         throw new ApiError(401, JSON.stringify({
             errors: [{
                 code: 'UNAUTHORIZED',
@@ -70,7 +77,7 @@ async function authenticate(req, perm) {
             }]
         }), {
             headers: {
-                'WWW-Authenticate': 'Basic realm="minocir" charset="UTF-8"',
+                'WWW-Authenticate': `Bearer realm="https://${hostname}/v2/token",service="minocir"`,
                 'Content-Type': 'application/json',
                 'Docker-Distribution-API-Version': 'registry/2.0',
             }
@@ -81,7 +88,8 @@ async function authenticate(req, perm) {
 
     let auth = req.headers.get('authorization');
 
-    let m = auth.trim().match(/^basic[ ]+([a-z0-9+/]{1,500}={0,2})$/i);
+    // allow sending basic auth as a bearer token, too
+    let m = auth.trim().match(/^(?:basic|bearer)[ ]+([a-z0-9+/]{1,500}={0,2})$/i);
     assert(m);
 
     let [user, pass] = Buffer.from(m[1], 'base64').toString().split(':', 2);
@@ -157,9 +165,19 @@ const upload_sessions = {};
 
 const routes = {};
 
+routes["/v2/token"] = {
+    GET: async req => {
+        // XXX: We're returning the basic auth. Not very secure...
+        if (req.headers.has('authorization')) {
+            return Response.json({token: req.headers.get('authorization').replace(/^basic /i, "")});
+        } else {
+            return Response.json({token: "Kjoq"}); // *:* base64 encoded
+        }
+    }
+};
+
 routes["/v2/"] = {
     GET: async req => {
-        console.log(req);
         await authenticate(req, 'r');
         return new Response();
     }
@@ -397,7 +415,7 @@ Bun.serve({
 
     async error(err) {
         if (err instanceof ApiError) {
-            return new Response(err.message, {
+            return new Response(err.message || null, {
                 status: err.status,
                 ...err.params,
             });
