@@ -15,6 +15,10 @@ const MANIFEST_ROOT = path.join(env.DATA_REPO, 'manifests');
 let access_file = Bun.file(path.join(env.DATA_REPO, 'access'));
 const access = {};
 
+await fs.mkdir(BLOB_ROOT, { recursive: true })
+await fs.mkdir(SESSION_ROOT, { recursive: true })
+await fs.mkdir(MANIFEST_ROOT, { recursive: true })
+
 if (await access_file.exists()) {
     for (let line of (await access_file.text()).split('\n')) {
         line = line.trim();
