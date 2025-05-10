@@ -67,7 +67,7 @@ async function authenticate(req, perm) {
             }]
         }), {
             headers: {
-                'WWW-Authenticate': 'Basic realm="l.bain.cz" charset="UTF-8"',
+                'WWW-Authenticate': 'Basic realm="minocir" charset="UTF-8"',
                 'Content-Type': 'application/json',
                 'Docker-Distribution-API-Version': 'registry/2.0',
             }
