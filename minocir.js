@@ -8,6 +8,9 @@ const env = {
     DATA_REPO: path.resolve(process.env.DATA_REPO || './data'),
 };
 
+// Minocir only supports manifest v2 for now.
+const MANIFEST_MIME_TYPE = "application/vnd.docker.distribution.manifest.v2+json";
+
 const BLOB_ROOT = path.join(env.DATA_REPO, 'blobs');
 const SESSION_ROOT = path.join(env.DATA_REPO, 'sessions');
 const MANIFEST_ROOT = path.join(env.DATA_REPO, 'manifests');
@@ -40,7 +43,7 @@ if (await access_file.exists()) {
         # format: user:token:perms
         # perms is a string made of 'r' for read, 'w' for write
         # Beware, token is in plain text. Only use generated tokens, not user passwords.
-    `.split('\n').map(l=>l.trim()).filter(l=>l).join('\n') + '\n');
+    `.split('\n').map(l => l.trim()).filter(l => l).join('\n') + '\n');
 }
 
 class ApiError extends Error {
@@ -331,6 +334,7 @@ routes["/v2/:repo/:image/manifests/:reference"] = {
         return new Response(null, {
             headers: {
                 'Docker-Content-Digest': `sha256:${hash}`,
+                'Content-Type': MANIFEST_MIME_TYPE,
             }
         });
     },
@@ -350,6 +354,7 @@ routes["/v2/:repo/:image/manifests/:reference"] = {
         return new Response(f, {
             headers: {
                 'Docker-Content-Digest': `sha256:${hash}`,
+                'Content-Type': MANIFEST_MIME_TYPE,
             }
         });
     },
