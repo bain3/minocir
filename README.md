@@ -1,6 +1,6 @@
 # Miniature OCI Registry
 
-Minocir is an exremely minimal OCI registry. It is a single `js` file written for `bun`.
+Minocir is an exremely minimal OCI/Docker registry. It is a single `js` file written for `bun`.
 
 Features:
 
