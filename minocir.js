@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { setTimeout } from 'node:timers';
 
 const env = {
     BIND_PORT: Number(process.env.BIND_PORT || 8080),
@@ -15,38 +16,75 @@ const BLOB_ROOT = path.join(env.DATA_REPO, 'blobs');
 const SESSION_ROOT = path.join(env.DATA_REPO, 'sessions');
 const MANIFEST_ROOT = path.join(env.DATA_REPO, 'manifests');
 
-let access_file = Bun.file(path.join(env.DATA_REPO, 'access'));
-const access = {};
+async function get_users() {
+    let access_file = Bun.file(path.join(env.DATA_REPO, 'access'));
+    const access = {};
 
-await fs.mkdir(BLOB_ROOT, { recursive: true })
-await fs.mkdir(SESSION_ROOT, { recursive: true })
-await fs.mkdir(MANIFEST_ROOT, { recursive: true })
+    await fs.mkdir(BLOB_ROOT, { recursive: true })
+    await fs.mkdir(SESSION_ROOT, { recursive: true })
+    await fs.mkdir(MANIFEST_ROOT, { recursive: true })
 
-if (await access_file.exists()) {
-    for (let line of (await access_file.text()).split('\n')) {
-        line = line.trim();
-        if (line.startsWith('#') || !line) continue;
+    if (await access_file.exists()) {
+        for (let line of (await access_file.text()).split('\n')) {
+            line = line.trim();
+            if (line.startsWith('#') || !line) continue;
 
-        const parts = line.split(":");
-        if (parts.length != 3) {
-            console.log('skipping invalid line');
-            continue;
+            const parts = line.split(":");
+            if (parts.length != 3) {
+                console.log('skipping invalid line');
+                continue;
+            }
+
+            let [user, token, perms] = parts;
+
+            access[user] = { token, perms };
         }
-
-        let [user, token, perms] = parts;
-
-        access[user] = { token, perms };
+    } else {
+        await Bun.write(access_file, `
+            # User definition file
+            # format: user:token:perms
+            # perms is a string made of 'r' for read, 'w' for write
+            # Beware, token is in plain text. Only use generated tokens, not user passwords.
+            # The special combination *:* is anonymous access
+            *:*:r
+        `.split('\n').map(l => l.trim()).filter(l => l).join('\n') + '\n');
     }
-} else {
-    await Bun.write(access_file, `
-        # User definition file
-        # format: user:token:perms
-        # perms is a string made of 'r' for read, 'w' for write
-        # Beware, token is in plain text. Only use generated tokens, not user passwords.
-        # The special combination *:* is anonymous access
-        *:*:r
-    `.split('\n').map(l => l.trim()).filter(l => l).join('\n') + '\n');
+
+    return access;
 }
+
+async function count_blob_references() {
+    const blob_rc = {};
+
+    for (let blob of await fs.readdir(BLOB_ROOT)) {
+        blob_rc[blob] = 0;
+    }
+
+    for (let file of await fs.readdir(MANIFEST_ROOT)) {
+        const filepath = path.join(MANIFEST_ROOT, file);
+
+        // filter out symlinks
+        try {
+            await fs.readlink(filepath);
+            continue;
+        } catch (e) { }
+
+        try {
+            const manifest = await Bun.file(filepath).json();
+
+            blob_rc[manifest.config.digest] += 1;
+            for (let layer of manifest.layers) {
+                blob_rc[layer.digest] += 1;
+            }
+        } catch (e) {
+            console.warn("blob counting: could not process manifest", file);
+            console.debug(e);
+        }
+    }
+
+    return blob_rc;
+}
+
 
 class ApiError extends Error {
     constructor(status, message, params = null) {
@@ -118,50 +156,12 @@ async function streamHash(stream, algorithm = 'sha256') {
     return shasum.digest('hex');
 }
 
-// {{{ File server
-
-function file_server(root) {
-    return {
-        head: async (filename) => {
-            const file_path = path.join(root, filename);
-            const f = Bun.file(file_path);
-
-            if (!await f.exists()) {
-                throw new ApiError(404, null);
-            }
-
-            const hash = await streamHash(Bun.file(file_path).stream(), 'sha256');
-
-            return new Response(null, {
-                headers: {
-                    'Docker-Content-Digest': `sha256:${hash}`,
-                },
-            });
-        },
-
-        get: async (filename) => {
-            const file_path = path.join(root, filename);
-            const f = Bun.file(file_path);
-
-            if (!await f.exists()) {
-                throw new ApiError(404, null);
-            }
-
-            const hash = await streamHash(Bun.file(file_path).stream(), 'sha256');
-
-            return new Response(f, {
-                headers: {
-                    'Docker-Content-Digest': `sha256:${hash}`,
-                },
-            });
-        },
-    }
-}
-
-// }}}
-
-const upload_sessions = {};
 // XXX: clean up old sessions
+const upload_sessions = {};
+const access = await get_users();
+
+// for restricting garbage collection
+let last_upload = 0;
 
 const routes = {};
 
@@ -169,9 +169,9 @@ routes["/v2/token"] = {
     GET: async req => {
         // XXX: We're returning the basic auth. Not very secure...
         if (req.headers.has('authorization')) {
-            return Response.json({token: req.headers.get('authorization').replace(/^basic /i, "")});
+            return Response.json({ token: req.headers.get('authorization').replace(/^basic /i, "") });
         } else {
-            return Response.json({token: "Kjoq"}); // *:* base64 encoded
+            return Response.json({ token: "Kjoq" }); // *:* base64 encoded
         }
     }
 };
@@ -205,12 +205,14 @@ routes["/v2/:repo/:image/blobs/uploads/"] = {
             },
         });
     },
-}
+};
 
 routes["/v2/sessions/:filename"] = {
     PATCH: async req => {
         const entry = upload_sessions[req.params.filename];
         if (!entry || entry.lock) throw new ApiError(404, "session not found");
+
+        last_upload = Date.now();
 
         try {
             entry.lock = true;
@@ -294,13 +296,25 @@ routes["/v2/sessions/:filename"] = {
     }
 };
 
-function manifest_filename(repo, image, ref) {
-    return `${repo}:${image}:${ref}`;
+async function get_file_with_digest(root, filename, with_body) {
+    const file_path = path.join(root, filename);
+    const f = Bun.file(file_path);
+
+    if (!await f.exists()) {
+        throw new ApiError(404, null);
+    }
+
+    const hash = await streamHash(f.stream(), 'sha256');
+
+    return new Response(with_body ? f : null, {
+        headers: {
+            'Docker-Content-Digest': `sha256:${hash}`,
+        },
+    });
 }
 
-async function resolve_manifest_reference(repo, image, ref) {
-    const real_path = await fs.realpath(path.join(MANIFEST_ROOT, manifest_filename(repo, image, ref)));
-    return path.basename(real_path);
+function manifest_filename(repo, image, ref) {
+    return `${repo}:${image}:${ref}`;
 }
 
 routes["/v2/:repo/:image/manifests/:reference"] = {
@@ -320,9 +334,10 @@ routes["/v2/:repo/:image/manifests/:reference"] = {
         const reference_filename = manifest_filename(req.params.repo, req.params.image, req.params.reference);
         const reference_full_path = path.join(MANIFEST_ROOT, reference_filename);
 
-        if (await fs.readlink(reference_full_path)) {
+        try {
+            await fs.readlink(reference_full_path);
             await fs.unlink(reference_full_path);
-        }
+        } catch (e) { }
 
         await fs.symlink(canon_filename, reference_full_path);
 
@@ -341,64 +356,60 @@ routes["/v2/:repo/:image/manifests/:reference"] = {
         await authenticate(req, 'r');
 
         const reference_filename = manifest_filename(req.params.repo, req.params.image, req.params.reference);
-        const f = Bun.file(path.join(MANIFEST_ROOT, reference_filename));
 
-        if (!await f.exists()) {
-            throw new ApiError(404, "manifest not found");
-        }
+        const response = await get_file_with_digest(MANIFEST_ROOT, reference_filename, false);
+        response.headers.set('Content-Type', MANIFEST_MIME_TYPE);
 
-        const hash = await streamHash(f.stream());
-
-        return new Response(null, {
-            headers: {
-                'Docker-Content-Digest': `sha256:${hash}`,
-                'Content-Type': MANIFEST_MIME_TYPE,
-            }
-        });
+        return response;
     },
 
     GET: async req => {
         await authenticate(req, 'r');
 
         const reference_filename = manifest_filename(req.params.repo, req.params.image, req.params.reference);
-        const f = Bun.file(path.join(MANIFEST_ROOT, reference_filename));
 
-        if (!await f.exists()) {
-            throw new ApiError(404, "manifest not found");
-        }
+        const response = await get_file_with_digest(MANIFEST_ROOT, reference_filename, true);
+        response.headers.set('Content-Type', MANIFEST_MIME_TYPE);
 
-        const hash = await streamHash(f.stream());
-
-        return new Response(f, {
-            headers: {
-                'Docker-Content-Digest': `sha256:${hash}`,
-                'Content-Type': MANIFEST_MIME_TYPE,
-            }
-        });
+        return response;
     },
 
     DELETE: async req => {
         await authenticate(req, 'w');
 
-        const manifest_filename = await resolve_manifest_reference(req.params.repo, req.params.image, req.params.reference);
+        const reference_filename = manifest_filename(req.params.repo, req.params.image, req.params.reference);
 
-        await fs.unlink(path.join(MANIFEST_ROOT, manifest_filename));
-        // XXX: clean up symlinked files
+        try {
+            await fs.unlink(path.join(MANIFEST_ROOT, reference_filename));
+        } catch (e) {
+            // the manifest reference does not exist
+            return new Response();
+        }
+
+        // clean up manifest symlinks
+        for (let filename of await fs.readdir(MANIFEST_ROOT)) {
+            try {
+                const f = path.join(MANIFEST_ROOT, filename);
+                if (await Bun.file(f).exists()) {
+                    continue;
+                }
+
+                await fs.unlink(f);
+            } catch (e) { }
+        }
 
         return new Response();
     }
 };
 
-const blob_fs = file_server(BLOB_ROOT);
-
 routes["/v2/:repo/:image/blobs/:digest"] = {
     HEAD: async req => {
         await authenticate(req, 'r');
-        return await blob_fs.head(req.params.digest)
+        return await get_file_with_digest(BLOB_ROOT, req.params.digest, false);
     },
     GET: async req => {
         await authenticate(req, 'r');
-        return await blob_fs.get(req.params.digest)
+        return await get_file_with_digest(BLOB_ROOT, req.params.digest, true);
     },
 };
 
@@ -407,6 +418,41 @@ console.log(`Starting minocir at http://${env.BIND_ADDR}:${env.BIND_PORT}`);
 for (let file of await fs.readdir(SESSION_ROOT)) {
     await fs.unlink(path.join(SESSION_ROOT, file));
 }
+
+const SESSION_EXPIRATION = 60 * 60 * 1000;
+const MIN_INACITIVTY = 5 * 60 * 1000;
+const GC_INTERVAL = 30 * 60 * 1000;
+
+async function garbage_collection() {
+    if (last_upload > Date.now() - MIN_INACITIVTY) {
+        setTimeout(garbage_collection, GC_INTERVAL);
+        return;
+    }
+
+    // clean up blobs
+    const blob_refs = await count_blob_references();
+    for (let blob of Object.keys(blob_refs)) {
+        if (blob_refs[blob] <= 0) {
+            try {
+                await fs.unlink(path.join(BLOB_ROOT, blob));
+            } catch (e) {
+                console.warn("garbage_collection: cannot unlink", blob);
+            }
+        }
+    }
+
+    // clean up old sessions
+    for (let session of Object.keys(upload_sessions)) {
+        if (upload_sessions[session].ts <= Date.now() - SESSION_EXPIRATION) {
+            upload_sessions[session].file.end();
+            delete upload_sessions[session];
+        }
+    }
+
+    setTimeout(garbage_collection, GC_INTERVAL);
+}
+
+garbage_collection();
 
 Bun.serve({
     port: env.BIND_PORT,
