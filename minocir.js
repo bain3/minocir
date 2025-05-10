@@ -428,7 +428,6 @@ Bun.serve({
     },
 
     async fetch(req) {
-        console.log(req);
         return new Response(null, {
             status: 404,
         })
